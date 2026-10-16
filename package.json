@@ -2,6 +2,6 @@
   "name": "sentry-triage",
   "private": true,
   "scripts": {
-    "test": "bash tests/run.sh"
+    "test": "cargo build --release && bash tests/run.sh"
   }
 }

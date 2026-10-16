@@ -2,8 +2,10 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# Test the script the skill actually ships; the root bin/triage is only a convenience symlink.
-TRIAGE="$ROOT/skills/sentry-triage/bin/triage"
+# Binary under test (default: the release build); the shim is tested separately below.
+TRIAGE="${TRIAGE:-$ROOT/target/release/triage}"
+case "$TRIAGE" in /*) ;; *) TRIAGE="$PWD/$TRIAGE" ;; esac
+SHIM="$ROOT/skills/sentry-triage/bin/triage"
 FIX="$ROOT/tests/fixtures"
 PASS=0; FAIL=0
 
@@ -13,7 +15,7 @@ setup() {
   export SENTRY_TRIAGE_HOME="$TMP/store"
   export HOME="$TMP/home"                 # isolates global git config too
   unset XDG_CONFIG_HOME                   # CI runners set it; config must follow $HOME
-  unset SENTRY_TRIAGE_NO_RG
+  unset SENTRY_TRIAGE_BIN SENTRY_TRIAGE_RELEASE_BASE
   export GIT_CONFIG_NOSYSTEM=1
   mkdir -p "$HOME" "$TMP/work"
   git config --global user.email "test@example.com"
@@ -67,7 +69,8 @@ test_version_help_and_usage_errors() {
 test_bin_symlink_is_relative_and_works() {
   [ -L "$ROOT/bin/triage" ] || fail "bin/triage is not a symlink"
   assert_eq "$(readlink "$ROOT/bin/triage")" "../skills/sentry-triage/bin/triage"
-  assert_rc 0 "$ROOT/bin/triage" --version
+  assert_rc 0 env SENTRY_TRIAGE_BIN="$TRIAGE" "$ROOT/bin/triage" --version
+  assert_contains "$OUT" "triage 0."
 }
 
 test_init_creates_git_store_and_is_idempotent() {
@@ -310,17 +313,14 @@ test_find_searches_state_journal_and_evidence() {
   assert_eq "$OUT" ""
 }
 
-test_find_is_fixed_string_and_grep_fallback_matches() {
+test_find_is_fixed_string() {
   find_fixture
   assert_rc 0 "$TRIAGE" find "Traceback line"
   assert_contains "$OUT" "trace.txt:1:Traceback line"
   assert_rc 0 "$TRIAGE" find "Error.*"          # regex metachars are literal
   assert_eq "$OUT" ""
   assert_rc 0 "$TRIAGE" find "TimeoutError: Pool"
-  local with_rg="$OUT"
-  export SENTRY_TRIAGE_NO_RG=1
-  assert_rc 0 "$TRIAGE" find "TimeoutError: Pool"
-  assert_eq "$OUT" "$with_rg"
+  assert_contains "$OUT" "evidence/trace.txt:2:TimeoutError: Pool Exhausted"
 }
 
 test_check_ok_and_counts() {
@@ -515,6 +515,96 @@ test_backup_explains_commit_failure() {
   git config --global user.useConfigOnly true
   assert_rc 1 "$TRIAGE" backup
   assert_contains "$OUT" "git commit failed"
+}
+
+# ---------------- shim tests ----------------
+
+shim_version() { tr -d '[:space:]' < "$ROOT/skills/sentry-triage/bin/VERSION"; }
+
+test_shim_honours_sentry_triage_bin() {
+  assert_rc 0 env SENTRY_TRIAGE_BIN="$TRIAGE" "$SHIM" --version
+  assert_contains "$OUT" "triage 0."
+  printf '#!/bin/sh\necho "fake $*"\n' > "$TMP/fake"
+  chmod +x "$TMP/fake"
+  assert_rc 0 env SENTRY_TRIAGE_BIN="$TMP/fake" "$SHIM" a "b c"
+  assert_eq "$OUT" "fake a b c"
+  # exit codes pass through
+  assert_rc 2 env SENTRY_TRIAGE_BIN="$TRIAGE" "$SHIM" frobnicate
+}
+
+test_shim_follows_symlinks_to_find_version_file() {
+  mkdir -p "$TMP/bin"
+  ln -s "$SHIM" "$TMP/bin/triage"
+  export XDG_CACHE_HOME="$TMP/cache"
+  mkdir -p "$XDG_CACHE_HOME/sentry-triage/$(shim_version)"
+  printf '#!/bin/sh\necho cached\n' > "$XDG_CACHE_HOME/sentry-triage/$(shim_version)/triage"
+  chmod +x "$XDG_CACHE_HOME/sentry-triage/$(shim_version)/triage"
+  assert_rc 0 "$TMP/bin/triage"
+  assert_eq "$OUT" "cached"
+}
+
+test_shim_uses_cached_binary_without_network() {
+  export XDG_CACHE_HOME="$TMP/cache"
+  local d
+  d="$XDG_CACHE_HOME/sentry-triage/$(shim_version)"
+  mkdir -p "$d"
+  printf '#!/bin/sh\necho "cached $*"\n' > "$d/triage"
+  chmod +x "$d/triage"
+  assert_rc 0 env SENTRY_TRIAGE_RELEASE_BASE="file:///nonexistent" "$SHIM" x y
+  assert_eq "$OUT" "cached x y"
+}
+
+test_shim_cache_defaults_to_home_cache() {
+  unset XDG_CACHE_HOME
+  local d
+  d="$HOME/.cache/sentry-triage/$(shim_version)"
+  mkdir -p "$d"
+  printf '#!/bin/sh\necho home-cache\n' > "$d/triage"
+  chmod +x "$d/triage"
+  assert_rc 0 "$SHIM"
+  assert_eq "$OUT" "home-cache"
+}
+
+test_shim_missing_binary_and_no_network_exits_127() {
+  export XDG_CACHE_HOME="$TMP/cache"
+  assert_rc 127 env SENTRY_TRIAGE_RELEASE_BASE="http://127.0.0.1:9/nope" "$SHIM" --version
+  assert_contains "$OUT" "http://127.0.0.1:9/nope/v$(shim_version)/triage-"
+  assert_contains "$OUT" "cargo install --git"
+  assert_contains "$OUT" "SENTRY_TRIAGE_BIN"
+  [ ! -e "$XDG_CACHE_HOME/sentry-triage/$(shim_version)/triage" ] || fail "failed download left a binary"
+}
+
+test_shim_downloads_verifies_and_caches() {
+  command -v tar >/dev/null 2>&1 || return 0
+  local v target base
+  v="$(shim_version)"
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64) target=aarch64-apple-darwin ;;
+    Darwin-x86_64) target=x86_64-apple-darwin ;;
+    Linux-x86_64) target=x86_64-unknown-linux-musl ;;
+    Linux-aarch64|Linux-arm64) target=aarch64-unknown-linux-musl ;;
+    *) return 0 ;;
+  esac
+  base="$TMP/rel"
+  mkdir -p "$base/v$v" "$TMP/pkg"
+  cp "$TRIAGE" "$TMP/pkg/triage"
+  tar -C "$TMP/pkg" -czf "$base/v$v/triage-$target.tar.gz" triage
+  export XDG_CACHE_HOME="$TMP/cache"
+  # wrong checksum is rejected
+  printf '%s  triage-%s.tar.gz\n' 0000000000000000000000000000000000000000000000000000000000000000 "$target" > "$base/v$v/triage-$target.tar.gz.sha256"
+  assert_rc 127 env SENTRY_TRIAGE_RELEASE_BASE="file://$base" "$SHIM" --version
+  assert_contains "$OUT" "checksum"
+  [ ! -e "$XDG_CACHE_HOME/sentry-triage/$v/triage" ] || fail "bad checksum left a binary"
+  # correct checksum is accepted and cached
+  if command -v sha256sum >/dev/null 2>&1; then
+    ( cd "$base/v$v" && sha256sum "triage-$target.tar.gz" > "triage-$target.tar.gz.sha256" )
+  else
+    ( cd "$base/v$v" && shasum -a 256 "triage-$target.tar.gz" > "triage-$target.tar.gz.sha256" )
+  fi
+  assert_rc 0 env SENTRY_TRIAGE_RELEASE_BASE="file://$base" "$SHIM" --version
+  assert_contains "$OUT" "triage 0."
+  [ -x "$XDG_CACHE_HOME/sentry-triage/$v/triage" ] || fail "binary not cached"
+  assert_rc 0 env SENTRY_TRIAGE_RELEASE_BASE="file:///nonexistent" "$SHIM" --version
 }
 
 # ---------------- runner ----------------

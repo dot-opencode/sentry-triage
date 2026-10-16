@@ -4,7 +4,35 @@ on:
   push:
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - run: TRIAGE=target/release/triage bash tests/run.sh
+
   shellcheck:
     runs-on: ubuntu-latest
     steps:
@@ -12,26 +40,3 @@ jobs:
       - run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck
       - run: shellcheck --version
       - run: shellcheck skills/sentry-triage/bin/triage tests/run.sh
-
-  test-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: bash --version | head -1
-      - run: bash tests/run.sh
-
-  # Stock macOS ships bash 3.2 as /bin/bash; GitHub's image also has a newer
-  # bash on PATH. Put a shim first so `#!/usr/bin/env bash` resolves to 3.2.
-  test-macos-bash32:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Force bash 3.2 on PATH
-        run: |
-          mkdir -p "$RUNNER_TEMP/bash32"
-          ln -s /bin/bash "$RUNNER_TEMP/bash32/bash"
-          echo "$RUNNER_TEMP/bash32" >> "$GITHUB_PATH"
-      - run: |
-          bash --version | head -1
-          case "$(bash --version | head -1)" in *"version 3.2"*) ;; *) echo "expected bash 3.2 on PATH"; exit 1 ;; esac
-      - run: bash tests/run.sh

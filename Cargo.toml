@@ -1,0 +1,20 @@
+[package]
+name = "sentry-triage"
+version = "0.2.0"
+edition = "2021"
+description = "Record Sentry issue investigations in a git-backed store"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "triage"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

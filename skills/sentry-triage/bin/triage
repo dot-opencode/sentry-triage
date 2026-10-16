@@ -1,625 +1,94 @@
-#!/usr/bin/env bash
-set -euo pipefail
-VERSION="0.1.0"
+#!/bin/sh
+# Shim for the sentry-triage binary: runs $SENTRY_TRIAGE_BIN, else the cached
+# release binary for bin/VERSION, downloading it from GitHub releases on first use.
+#   SENTRY_TRIAGE_BIN           use this binary and nothing else
+#   SENTRY_TRIAGE_RELEASE_BASE  override the download base URL
+#                               (default https://github.com/dot-opencode/sentry-triage/releases/download)
+set -eu
 
-# See memory's `use_utf8_ctype`: launchd and cron start without LANG, and
-# tr/awk would then treat non-ASCII bytes inconsistently. Pick a UTF-8 LC_CTYPE.
-use_utf8_ctype() {
-  local cur="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" have l nl=$'\n'
-  case "$cur" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) return 0 ;; esac
-  have="$nl$(locale -a 2>/dev/null || true)$nl"
-  for l in C.UTF-8 en_US.UTF-8 C.utf8 en_US.utf8; do
-    case "$have" in
-      *"$nl$l$nl"*)
-        if [ -n "${LC_ALL:-}" ]; then export LC_ALL="$l"; else export LC_CTYPE="$l"; fi
-        return 0 ;;
-    esac
-  done
-}
-use_utf8_ctype
+REPO_URL="https://github.com/dot-opencode/sentry-triage"
 
-STORE="${SENTRY_TRIAGE_HOME:-${HOME:?HOME is not set}/.sentry-triage}"
-case "$STORE" in
-  /*) ;;
-  *) STORE="$(pwd -P)/$STORE" ;;
+if [ -n "${SENTRY_TRIAGE_BIN:-}" ]; then
+  exec "$SENTRY_TRIAGE_BIN" "$@"
+fi
+
+# Resolve symlinks to find our own directory (works via ~/.local/bin/triage).
+self="$0"
+while [ -h "$self" ]; do
+  dir="$(cd -P "$(dirname "$self")" && pwd)"
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *) self="$dir/$link" ;;
+  esac
+done
+here="$(cd -P "$(dirname "$self")" && pwd)"
+
+version="$(tr -d '[:space:]' < "$here/VERSION")"
+cache="${XDG_CACHE_HOME:-${HOME:?HOME is not set}/.cache}/sentry-triage/$version"
+bin="$cache/triage"
+
+if [ -x "$bin" ]; then
+  exec "$bin" "$@"
+fi
+
+base="${SENTRY_TRIAGE_RELEASE_BASE:-$REPO_URL/releases/download}"
+
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64 | Darwin-aarch64) target="aarch64-apple-darwin" ;;
+  Darwin-x86_64) target="x86_64-apple-darwin" ;;
+  Linux-x86_64 | Linux-amd64) target="x86_64-unknown-linux-musl" ;;
+  Linux-aarch64 | Linux-arm64) target="aarch64-unknown-linux-musl" ;;
+  *) target="$(uname -s)-$(uname -m)" ;;
 esac
 
-TAB=$'\t'
-RE_ID='^[A-Za-z0-9][A-Za-z0-9._-]*$'
-RE_REL='^([A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*$'
-RE_URL='^https?://[^[:space:]]+$'
-RE_SHA='^[0-9a-fA-F]{4,40}$'
-RE_DATE='^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'
-FM_KEYS="schema issue org project url status verdict confidence tracker related repo commit created updated"
-SETTABLE="project url status verdict confidence tracker related repo commit"
+asset="triage-$target.tar.gz"
+url="$base/v$version/$asset"
 
-usage() {
-  cat <<'EOF'
-usage: triage <command> [args]        (triage --version prints the version)
-
-commands:
-  init                                      create the store (a git repo)
-  new <ISSUE> --org <org> [--project p] [--url u] [--repo r] [--commit c]
-                                            create an entry
-  log <ISSUE> [--org o] <text...|->         append a journal entry (- reads stdin)
-  set <ISSUE> [--org o] key=value...        update frontmatter (tracker+=X, related+=X append)
-  show <ISSUE> [--org o]                    print state.md and journal.md
-  path <ISSUE> [--org o]                    print the entry directory
-  list [--org o] [--status s] [--verdict v] one line per entry, newest first
-  find <pattern>                            case-insensitive fixed-string search
-  check                                     validate every entry
-  import <dir> --org <org> [--project p]    import legacy per-issue directories
-  backup [--push]                           commit (and push) the store
-  help                                      this text
-
-store: $SENTRY_TRIAGE_HOME (default ~/.sentry-triage)
-exit codes: 0 ok, 1 error / check failed, 2 usage error
-EOF
-}
-
-die() { echo "triage: $*" >&2; exit 1; }
-usage_err() { echo "triage: $*" >&2; echo "run 'triage help' for usage" >&2; exit 2; }
-
-upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
-valid_id() { [[ "$1" =~ $RE_ID ]]; }
-now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-today() { date -u +%Y-%m-%d; }
-
-require_store() {
-  [ -d "$STORE" ] || die "no store at $STORE (run 'triage init')"
-}
-
-# ---------------------------------------------------------------- lists
-
-# One item per line, trimmed, empty items dropped.
-list_items() {
-  printf '%s\n' "$1" | awk -F, '{ for (i = 1; i <= NF; i++) { gsub(/^[ \t]+|[ \t]+$/, "", $i); if ($i != "") print $i } }'
-}
-
-# Deduplicated "a, b, c" form of a comma list.
-list_norm() {
-  list_items "$1" | awk '!seen[$0]++' | paste -sd, - | sed 's/,/, /g'
-}
-
-# ---------------------------------------------------------- frontmatter
-
-# Value of one flat frontmatter key; empty when missing.
-fm_get() {
-  awk -v k="$2" '
-    NR == 1 { if ($0 != "---") exit; next }
-    /^---$/ { exit }
-    index($0, k ":") == 1 { v = substr($0, length(k) + 2); sub(/^ /, "", v); print v; exit }
-  ' "$1"
-}
-
-# Replace the value of an existing frontmatter key, in place.
-fm_put() {   # fm_put <file> <key> <value>
-  local f="$1" tmp
-  tmp="$f.tmp.$$"
-  FM_K="$2" FM_V="$3" awk '
-    BEGIN { k = ENVIRON["FM_K"]; v = ENVIRON["FM_V"] }
-    NR == 1 { print; infm = ($0 == "---"); next }
-    infm && /^---$/ { infm = 0; print; next }
-    infm && index($0, k ":") == 1 { print (v == "" ? k ":" : k ": " v); next }
-    { print }
-  ' "$f" > "$tmp"
-  mv "$tmp" "$f"
-}
-
-# Prints an error message when value is invalid for key; nothing when valid.
-field_error() {   # field_error <key> <value>
-  local k="$1" v="$2" item
-  case "$k" in
-    project)
-      if [ -n "$v" ] && ! valid_id "$v"; then echo "invalid project '$v'"; fi ;;
-    url)
-      if [ -n "$v" ] && ! [[ "$v" =~ $RE_URL ]]; then echo "invalid url '$v' (expected http(s)://...)"; fi ;;
-    status)
-      case "$v" in open|closed) ;; *) echo "invalid status '$v' (open|closed)" ;; esac ;;
-    verdict)
-      case "$v" in unknown|bug|expected|investigate) ;; *) echo "invalid verdict '$v' (unknown|bug|expected|investigate)" ;; esac ;;
-    confidence)
-      case "$v" in ""|low|medium|high) ;; *) echo "invalid confidence '$v' (low|medium|high or empty)" ;; esac ;;
-    commit)
-      if [ -n "$v" ] && ! [[ "$v" =~ $RE_SHA ]]; then echo "invalid commit '$v' (expected a hex sha)"; fi ;;
-    repo)
-      case "$v" in *$'\n'*) echo "repo must be a single line" ;; esac ;;
-    tracker)
-      while IFS= read -r item; do
-        [ -n "$item" ] || continue
-        case "$item" in *[[:space:]]*) echo "invalid tracker item '$item' (no spaces)" ;; esac
-      done <<< "$(list_items "$v")" ;;
-    related)
-      while IFS= read -r item; do
-        [ -n "$item" ] || continue
-        if ! [[ "$item" =~ $RE_REL ]]; then echo "invalid related item '$item' (ORG/ISSUE or ISSUE)"; fi
-      done <<< "$(list_items "$v")" ;;
-  esac
-  return 0
-}
-
-# Uppercase the issue part of each related item; keep the org part as is.
-related_norm() {
-  list_items "$1" | awk '{
-    n = index($0, "/")
-    if (n > 0) print substr($0, 1, n) toupper(substr($0, n + 1)); else print toupper($0)
-  }' | awk '!seen[$0]++' | paste -sd, - | sed 's/,/, /g'
-}
-
-norm_field() {   # norm_field <key> <value>
-  case "$1" in
-    tracker) list_norm "$2" ;;
-    related) related_norm "$2" ;;
-    *) printf '%s' "$2" ;;
-  esac
-}
-
-# ------------------------------------------------------------- entries
-
-kv() { if [ -z "$2" ]; then printf '%s:\n' "$1"; else printf '%s: %s\n' "$1" "$2"; fi; }
-
-# Write a fresh state.md. Fails if the entry exists.
-create_entry() {   # create_entry <org> <issue> <project> <url> <repo> <commit> <tracker> <verdict> <confidence>
-  local org="$1" issue="$2" dir t
-  dir="$STORE/$org/$issue"
-  [ ! -e "$dir" ] || die "entry $org/$issue already exists"
-  mkdir -p "$dir/evidence"
-  t="$(today)"
+fail() {
   {
-    echo "---"
-    kv schema 1
-    kv issue "$issue"
-    kv org "$org"
-    kv project "$3"
-    kv url "$4"
-    kv status open
-    kv verdict "$8"
-    kv confidence "$9"
-    kv tracker "$7"
-    kv related ""
-    kv repo "$5"
-    kv commit "$6"
-    kv created "$t"
-    kv updated "$t"
-    echo "---"
-    echo
-    echo "## Error"
-    echo
-    echo "## Root cause"
-    echo
-    echo "## Evidence"
-    echo
-    echo "## Decision"
-    echo
-    echo "## Open questions"
-  } > "$dir/state.md"
-  printf '# Journal %s/%s\n' "$org" "$issue" > "$dir/journal.md"
+    echo "triage: $1"
+    echo "triage: tried: $url"
+    echo "triage: install it manually with"
+    echo "  cargo install --git $REPO_URL --tag v$version"
+    echo "and point the skill at it with SENTRY_TRIAGE_BIN=/path/to/triage"
+  } >&2
+  exit 127
 }
 
-journal_append() {   # journal_append <dir> <text>
-  printf '\n## %s\n%s\n' "$(now_utc)" "$2" >> "$1/journal.md"
-}
-
-ensure_store() {
-  mkdir -p "$STORE"
-  if [ ! -d "$STORE/.git" ]; then git -C "$STORE" init -q; fi
-}
-
-ENTRY_ORG="" ENTRY_ISSUE="" ENTRY_DIR=""
-resolve_entry() {   # resolve_entry <issue> <org-or-empty>
-  local org="$2" d n=0 orgs=""
-  valid_id "$1" || die "invalid issue id '$1'"
-  ENTRY_ISSUE="$(upper "$1")"
-  if [ -n "$org" ]; then
-    valid_id "$org" || die "invalid org '$org'"
-    [ -f "$STORE/$org/$ENTRY_ISSUE/state.md" ] || die "no entry $org/$ENTRY_ISSUE"
-    ENTRY_ORG="$org"
+fetch() {   # fetch <url> <dest>
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 15 -o "$2" "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$2" "$1"
   else
-    for d in "$STORE"/*/"$ENTRY_ISSUE"; do
-      [ -f "$d/state.md" ] || continue
-      n=$((n + 1))
-      ENTRY_ORG="$(basename "$(dirname "$d")")"
-      orgs="$orgs, $ENTRY_ORG"
-    done
-    [ "$n" -gt 0 ] || die "no entry for $ENTRY_ISSUE"
-    [ "$n" -eq 1 ] || die "$ENTRY_ISSUE exists in several orgs (${orgs#, }); pass --org"
+    return 1
   fi
-  ENTRY_DIR="$STORE/$ENTRY_ORG/$ENTRY_ISSUE"
 }
 
-# Parse "<ISSUE> [--org o]" in any order. Sets ARG_ISSUE, ARG_ORG, ARG_REST.
-ARG_ISSUE="" ARG_ORG="" ARG_REST=()
-parse_issue_args() {   # parse_issue_args <cmd> <args...>; stops at the first extra word
-  local cmd="$1"; shift
-  ARG_ISSUE="" ARG_ORG="" ARG_REST=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --org)
-        [ $# -ge 2 ] && [ -n "$2" ] || usage_err "$cmd: --org requires a value"
-        ARG_ORG="$2"; shift 2 ;;
-      *)
-        if [ -z "$ARG_ISSUE" ]; then ARG_ISSUE="$1"; shift; else break; fi ;;
-    esac
-  done
-  [ -n "$ARG_ISSUE" ] || usage_err "$cmd: missing <ISSUE>"
-  if [ $# -gt 0 ]; then ARG_REST=("$@"); fi
-}
-
-# ------------------------------------------------------------ commands
-
-cmd_init() {
-  [ $# -eq 0 ] || usage_err "usage: triage init"
-  ensure_store
-  echo "initialized: $STORE"
-}
-
-cmd_new() {
-  local issue="" org="" project="" url="" repo="" commit="" err
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --org|--project|--url|--repo|--commit)
-        [ $# -ge 2 ] || usage_err "new: $1 requires a value"
-        case "$1" in
-          --org) org="$2" ;; --project) project="$2" ;; --url) url="$2" ;;
-          --repo) repo="$2" ;; --commit) commit="$2" ;;
-        esac
-        shift 2 ;;
-      -*) usage_err "new: unknown option: $1" ;;
-      *) [ -z "$issue" ] || usage_err "new: unexpected argument: $1"; issue="$1"; shift ;;
-    esac
-  done
-  [ -n "$issue" ] || usage_err "usage: triage new <ISSUE> --org <org> [--project p] [--url u] [--repo r] [--commit c]"
-  [ -n "$org" ] || usage_err "new: --org is required"
-  valid_id "$issue" || die "invalid issue id '$issue'"
-  valid_id "$org" || die "invalid org '$org'"
-  issue="$(upper "$issue")"
-  for kvp in "project=$project" "url=$url" "repo=$repo" "commit=$commit"; do
-    err="$(field_error "${kvp%%=*}" "${kvp#*=}")"
-    [ -z "$err" ] || die "$err"
-  done
-  ensure_store
-  create_entry "$org" "$issue" "$project" "$url" "$repo" "$commit" "" unknown ""
-  journal_append "$STORE/$org/$issue" "created"
-  echo "created $org/$issue"
-}
-
-cmd_log() {
-  parse_issue_args log "$@"
-  [ "${#ARG_REST[@]}" -gt 0 ] || usage_err "usage: triage log <ISSUE> [--org o] <text...|->"
-  local text
-  if [ "${#ARG_REST[@]}" -eq 1 ] && [ "${ARG_REST[0]}" = "-" ]; then
-    text="$(cat)"
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
   else
-    text="${ARG_REST[*]}"
-  fi
-  [ -n "$text" ] || usage_err "log: empty text"
-  require_store
-  resolve_entry "$ARG_ISSUE" "$ARG_ORG"
-  journal_append "$ENTRY_DIR" "$text"
-  echo "logged $ENTRY_ORG/$ENTRY_ISSUE"
-}
-
-cmd_set() {
-  parse_issue_args set "$@"
-  [ "${#ARG_REST[@]}" -gt 0 ] || usage_err "usage: triage set <ISSUE> [--org o] key=value..."
-  require_store
-  resolve_entry "$ARG_ISSUE" "$ARG_ORG"
-  local state="$ENTRY_DIR/state.md" tmp arg key val op cur err status verdict log="" s_re='^([a-z]+)(\+?)=(.*)$'
-  tmp="$state.new.$$"
-  cp "$state" "$tmp"
-  for arg in "${ARG_REST[@]}"; do
-    [[ "$arg" =~ $s_re ]] || { rm -f "$tmp"; usage_err "set: expected key=value, got '$arg'"; }
-    key="${BASH_REMATCH[1]}"; op="${BASH_REMATCH[2]}"; val="${BASH_REMATCH[3]}"
-    case " $SETTABLE " in *" $key "*) ;; *) rm -f "$tmp"; die "key '$key' cannot be set (allowed: $SETTABLE)" ;; esac
-    if [ "$op" = "+" ]; then
-      case "$key" in tracker|related) ;; *) rm -f "$tmp"; die "'+=' only works for tracker and related" ;; esac
-      [ -n "$val" ] || { rm -f "$tmp"; die "set: empty value for $key+="; }
-    fi
-    # surrounding whitespace is never meaningful
-    val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
-    case "$val" in *$'\n'*) rm -f "$tmp"; die "value for $key must be a single line" ;; esac
-    if [ "$op" = "+" ]; then
-      err="$(field_error "$key" "$val")"
-      [ -z "$err" ] || { rm -f "$tmp"; die "$err"; }
-      cur="$(fm_get "$tmp" "$key")"
-      log="$log${log:+$'\n'}set $key+=$val"
-      val="$(norm_field "$key" "$cur, $val")"
-    else
-      err="$(field_error "$key" "$val")"
-      [ -z "$err" ] || { rm -f "$tmp"; die "$err"; }
-      val="$(norm_field "$key" "$val")"
-    fi
-    fm_put "$tmp" "$key" "$val"
-    [ "$op" = "+" ] || log="$log${log:+$'\n'}set $key=$val"
-  done
-  status="$(fm_get "$tmp" status)"
-  verdict="$(fm_get "$tmp" verdict)"
-  if [ "$status" = "closed" ] && [ "$verdict" = "unknown" ]; then
-    rm -f "$tmp"
-    die "cannot close $ENTRY_ORG/$ENTRY_ISSUE with verdict unknown; set verdict first"
-  fi
-  fm_put "$tmp" updated "$(today)"
-  mv "$tmp" "$state"
-  journal_append "$ENTRY_DIR" "$log"
-  echo "updated $ENTRY_ORG/$ENTRY_ISSUE"
-}
-
-cmd_show() {
-  parse_issue_args show "$@"
-  [ "${#ARG_REST[@]}" -eq 0 ] || usage_err "show: unexpected argument: ${ARG_REST[0]}"
-  require_store
-  resolve_entry "$ARG_ISSUE" "$ARG_ORG"
-  cat "$ENTRY_DIR/state.md"
-  if [ -f "$ENTRY_DIR/journal.md" ]; then
-    echo
-    cat "$ENTRY_DIR/journal.md"
+    return 1
   fi
 }
 
-cmd_path() {
-  parse_issue_args path "$@"
-  [ "${#ARG_REST[@]}" -eq 0 ] || usage_err "path: unexpected argument: ${ARG_REST[0]}"
-  require_store
-  resolve_entry "$ARG_ISSUE" "$ARG_ORG"
-  echo "$ENTRY_DIR"
-}
+mkdir -p "$cache" 2>/dev/null || fail "cannot create $cache"
+tmp="$(mktemp -d "$cache/.dl.XXXXXX" 2>/dev/null)" || fail "cannot create a temporary directory in $cache"
+trap 'rm -rf "$tmp"' EXIT INT TERM HUP
 
-cmd_list() {
-  local org="" status="" verdict=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --org|--status|--verdict)
-        [ $# -ge 2 ] || usage_err "list: $1 requires a value"
-        case "$1" in --org) org="$2" ;; --status) status="$2" ;; --verdict) verdict="$2" ;; esac
-        shift 2 ;;
-      *) usage_err "list: unexpected argument: $1" ;;
-    esac
-  done
-  [ -z "$status" ] || [ -z "$(field_error status "$status")" ] || die "$(field_error status "$status")"
-  [ -z "$verdict" ] || [ -z "$(field_error verdict "$verdict")" ] || die "$(field_error verdict "$verdict")"
-  require_store
-  local d o i f st vd rows="" nl=$'\n'
-  for d in "$STORE"/*/*/; do
-    [ -f "${d}state.md" ] || continue
-    d="${d%/}"
-    i="$(basename "$d")"; o="$(basename "$(dirname "$d")")"
-    [ -z "$org" ] || [ "$org" = "$o" ] || continue
-    f="$d/state.md"
-    st="$(fm_get "$f" status)"; vd="$(fm_get "$f" verdict)"
-    [ -z "$status" ] || [ "$status" = "$st" ] || continue
-    [ -z "$verdict" ] || [ "$verdict" = "$vd" ] || continue
-    rows="$rows$(fm_get "$f" updated)$TAB$o/$i$TAB$st$TAB$vd$TAB$(fm_get "$f" url)$nl"
-  done
-  [ -n "$rows" ] || return 0
-  printf '%s' "$rows" | LC_ALL=C sort -t "$TAB" -k1,1r -k2,2 | awk -F'\t' '{
-    printf "%s  %s  %s  %s", $2, $3, $4, $1
-    if ($5 != "") printf "  %s", $5
-    printf "\n"
-  }'
-}
+fetch "$url" "$tmp/$asset" || fail "download of the triage binary failed"
+fetch "$url.sha256" "$tmp/$asset.sha256" || fail "download of the checksum failed"
 
-cmd_find() {
-  [ $# -eq 1 ] || usage_err "usage: triage find <pattern>"
-  [ -n "$1" ] || usage_err "find: empty pattern"
-  require_store
-  local pat="$1" d o i targets
-  for d in "$STORE"/*/*/; do
-    [ -f "${d}state.md" ] || continue
-    d="${d%/}"
-    i="$(basename "$d")"; o="$(basename "$(dirname "$d")")"
-    targets="state.md"
-    [ ! -f "$d/journal.md" ] || targets="$targets journal.md"
-    [ ! -d "$d/evidence" ] || targets="$targets evidence"
-    # shellcheck disable=SC2086 # targets are fixed names without spaces
-    (
-      cd "$d"
-      if [ -z "${SENTRY_TRIAGE_NO_RG:-}" ] && command -v rg >/dev/null 2>&1; then
-        rg -i -F -n --no-heading --no-ignore --hidden --color never -e "$pat" -- $targets 2>/dev/null || true
-      else
-        grep -i -F -n -r -I -e "$pat" -- $targets 2>/dev/null || true
-      fi
-    ) | awk -v p="$o/$i" '{ print p ": " $0 }'
-  done
-}
+want="$(cut -d' ' -f1 < "$tmp/$asset.sha256" | tr -d '[:space:]')"
+got="$(sha256_of "$tmp/$asset")" || fail "neither sha256sum nor shasum is available to verify the download"
+[ -n "$want" ] && [ "$want" = "$got" ] || fail "checksum mismatch for $asset"
 
-# Does ORG/ISSUE (or ISSUE within org) exist?
-related_exists() {   # related_exists <item> <org>
-  local item="$1" org="$2" issue
-  case "$item" in
-    */*) org="${item%%/*}"; issue="${item#*/}" ;;
-    *) issue="$item" ;;
-  esac
-  [ -f "$STORE/$org/$(upper "$issue")/state.md" ]
-}
+tar -xzf "$tmp/$asset" -C "$tmp" triage || fail "cannot extract $asset"
+chmod +x "$tmp/triage"
+mv -f "$tmp/triage" "$bin" || fail "cannot install $bin"
 
-PROBLEMS=0
-prob() { echo "$CHECK_LABEL: $*"; PROBLEMS=$((PROBLEMS + 1)); }
-
-check_entry() {   # check_entry <dir>
-  local dir="$1" org issue f line key v item struct
-  issue="$(basename "$dir")"; org="$(basename "$(dirname "$dir")")"
-  CHECK_LABEL="$org/$issue"
-  f="$dir/state.md"
-  if ! valid_id "$org"; then prob "invalid org directory name"; fi
-  if ! valid_id "$issue"; then prob "invalid issue directory name"; fi
-  [ -f "$dir/journal.md" ] || prob "journal.md is missing"
-  if [ ! -f "$f" ]; then prob "state.md is missing"; return 0; fi
-  struct="$(FM_KEYS="$FM_KEYS" awk '
-    BEGIN { n = split(ENVIRON["FM_KEYS"], arr, " "); for (i = 1; i <= n; i++) K[arr[i]] = 1 }
-    NR == 1 { if ($0 != "---") { print "frontmatter: missing opening ---"; bad = 1; exit } next }
-    /^---$/ { closed = 1; exit }
-    {
-      if ($0 !~ /^[a-z]+:( .*)?$/) { print "frontmatter: malformed line " NR ": " $0; next }
-      k = $0; sub(/:.*/, "", k)
-      if (!(k in K)) { print "frontmatter: unknown key " k; next }
-      if (seen[k]++) print "frontmatter: duplicate key " k
-    }
-    END {
-      if (bad) exit
-      if (NR == 0) { print "frontmatter: state.md is empty"; exit }
-      if (!closed) { print "frontmatter: missing closing ---"; exit }
-      for (i = 1; i <= n; i++) if (!seen[arr[i]]) print "frontmatter: missing key " arr[i]
-    }' "$f")"
-  if [ -n "$struct" ]; then
-    while IFS= read -r line; do [ -z "$line" ] || prob "$line"; done <<< "$struct"
-    return 0
-  fi
-  [ "$(fm_get "$f" schema)" = "1" ] || prob "schema must be 1"
-  [ "$(fm_get "$f" issue)" = "$issue" ] || prob "issue '$(fm_get "$f" issue)' does not match directory"
-  [ "$(fm_get "$f" org)" = "$org" ] || prob "org '$(fm_get "$f" org)' does not match directory"
-  for key in project url status verdict confidence commit repo tracker related; do
-    v="$(fm_get "$f" "$key")"
-    line="$(field_error "$key" "$v")"
-    if [ -n "$line" ]; then
-      while IFS= read -r item; do prob "$item"; done <<< "$line"
-    fi
-  done
-  local created updated
-  created="$(fm_get "$f" created)"; updated="$(fm_get "$f" updated)"
-  [[ "$created" =~ $RE_DATE ]] || prob "invalid created date '$created'"
-  [[ "$updated" =~ $RE_DATE ]] || prob "invalid updated date '$updated'"
-  if [[ "$created" =~ $RE_DATE ]] && [[ "$updated" =~ $RE_DATE ]] && [[ "$updated" < "$created" ]]; then
-    prob "updated $updated is before created $created"
-  fi
-  if [ "$(fm_get "$f" status)" = "closed" ] && [ "$(fm_get "$f" verdict)" = "unknown" ]; then
-    prob "closed entry has verdict unknown"
-  fi
-  while IFS= read -r item; do
-    [ -n "$item" ] || continue
-    [[ "$item" =~ $RE_REL ]] || continue
-    related_exists "$item" "$org" || prob "related target '$item' does not exist"
-  done <<< "$(list_items "$(fm_get "$f" related)")"
-  return 0
-}
-
-cmd_check() {
-  [ $# -eq 0 ] || usage_err "usage: triage check"
-  require_store
-  local d n=0
-  CHECK_LABEL=""
-  for d in "$STORE"/*/*/; do
-    [ -d "$d" ] || continue
-    d="${d%/}"
-    n=$((n + 1))
-    check_entry "$d"
-  done
-  if [ "$PROBLEMS" -gt 0 ]; then
-    echo "triage: $PROBLEMS problem(s) in $n entries" >&2
-    exit 1
-  fi
-  echo "OK ($n entries)"
-}
-
-cmd_import() {
-  local src="" org="" project="" err
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --org|--project)
-        [ $# -ge 2 ] || usage_err "import: $1 requires a value"
-        if [ "$1" = "--org" ]; then org="$2"; else project="$2"; fi
-        shift 2 ;;
-      -*) usage_err "import: unknown option: $1" ;;
-      *) [ -z "$src" ] || usage_err "import: unexpected argument: $1"; src="$1"; shift ;;
-    esac
-  done
-  [ -n "$src" ] || usage_err "usage: triage import <dir> --org <org> [--project p]"
-  [ -n "$org" ] || usage_err "import: --org is required"
-  valid_id "$org" || die "invalid org '$org'"
-  err="$(field_error project "$project")"; [ -z "$err" ] || die "$err"
-  [ -d "$src" ] || die "not a directory: $src"
-  src="$(cd -P "$src" && pwd -P)"
-  ensure_store
-
-  local sub name issue text url tracker verdict confidence cls conf_line imported=0 skipped=0 ignored=0 dest summary
-  local re_sentry='https://[A-Za-z0-9.-]+\.sentry\.io/[A-Za-z0-9._~:/?#@&+=%-]*issues/[A-Za-z0-9._~:/?#@&+=%-]*'
-  local re_track='https?://[A-Za-z0-9.-]+/(issue|browse)/[A-Za-z][A-Za-z0-9]*-[0-9]+'
-  for sub in "$src"/*/; do
-    [ -d "$sub" ] || continue
-    sub="${sub%/}"
-    name="$(basename "$sub")"
-    if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_]*(-[A-Za-z0-9_]+)+$ ]]; then
-      echo "ignored $name (not an issue id)"
-      ignored=$((ignored + 1))
-      continue
-    fi
-    issue="$(upper "$name")"
-    if [ -e "$STORE/$org/$issue" ]; then
-      echo "skipped $org/$issue (exists)"
-      skipped=$((skipped + 1))
-      continue
-    fi
-    text="$(find "$sub" -type f -exec cat {} + 2>/dev/null || true)"
-    url="$(printf '%s\n' "$text" | grep -a -o -E "$re_sentry" | head -n 1 | sed -E 's/[.,;:!]+$//' || true)"
-    tracker="$(printf '%s\n' "$text" | grep -a -o -E "$re_track" | awk '!seen[$0]++' | paste -sd, - | sed 's/,/, /g' || true)"
-    cls="$(printf '%s\n' "$text" | grep -a -i -E '^[-*[:space:]]*(classification|verdict)[^:]*:' | grep -a -o -E 'bug_candidate|ignore_candidate|needs_investigation' | head -n 1 || true)"
-    [ -n "$cls" ] || cls="$(printf '%s\n' "$text" | grep -a -o -E 'bug_candidate|ignore_candidate|needs_investigation' | head -n 1 || true)"
-    case "$cls" in
-      bug_candidate) verdict=bug ;;
-      ignore_candidate) verdict=expected ;;
-      needs_investigation) verdict=investigate ;;
-      *) verdict=unknown ;;
-    esac
-    conf_line="$(printf '%s\n' "$text" | grep -a -i -E '^[-*[:space:]]*confidence[^:]*:' | head -n 1 | tr '[:upper:]' '[:lower:]' || true)"
-    confidence=""
-    case "$conf_line" in
-      *high*) confidence=high ;;
-      *medium*) confidence=medium ;;
-      *low*) confidence=low ;;
-    esac
-    create_entry "$org" "$issue" "$project" "$url" "" "" "$tracker" "$verdict" "$confidence"
-    dest="$STORE/$org/$issue"
-    mkdir -p "$dest/legacy"
-    cp -R "$sub/." "$dest/legacy/"
-    summary="imported from $sub"
-    summary="$summary"$'\n'"extracted: verdict=$verdict${url:+ url=$url}${tracker:+ tracker=$tracker}${confidence:+ confidence=$confidence}"
-    journal_append "$dest" "$summary"
-    echo "imported $org/$issue (verdict=$verdict${url:+, url}${tracker:+, tracker})"
-    imported=$((imported + 1))
-  done
-  echo "import: $imported imported, $skipped skipped, $ignored ignored"
-}
-
-cmd_backup() {
-  local push=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --push) push=1; shift ;;
-      *) usage_err "backup: unexpected argument: $1" ;;
-    esac
-  done
-  [ -d "$STORE/.git" ] || die "no store at $STORE (run 'triage init')"
-  local g=(git -C "$STORE" -c commit.gpgsign=false)
-  if [ -z "$("${g[@]}" status --porcelain --untracked-files=all)" ]; then
-    echo "nothing to commit"
-  else
-    "${g[@]}" add -A
-    "${g[@]}" commit -q -m "triage: backup $(now_utc)" >/dev/null || die "git commit failed (is user.name/user.email configured?)"
-    echo "committed"
-  fi
-  if [ "$push" -eq 1 ]; then
-    local remote
-    remote="$("${g[@]}" remote | head -n 1 || true)"
-    [ -n "$remote" ] || die "no git remote configured in $STORE"
-    "${g[@]}" push -q "$remote" HEAD || die "git push failed"
-    echo "pushed to $remote"
-  fi
-}
-
-[ $# -gt 0 ] || { usage >&2; exit 2; }
-cmd="$1"; shift
-case "$cmd" in
-  init) cmd_init "$@" ;;
-  new) cmd_new "$@" ;;
-  log) cmd_log "$@" ;;
-  set) cmd_set "$@" ;;
-  show) cmd_show "$@" ;;
-  path) cmd_path "$@" ;;
-  list) cmd_list "$@" ;;
-  find) cmd_find "$@" ;;
-  check) cmd_check "$@" ;;
-  import) cmd_import "$@" ;;
-  backup) cmd_backup "$@" ;;
-  --version|version) echo "triage $VERSION" ;;
-  help|-h|--help) usage ;;
-  *) usage_err "unknown command: $cmd" ;;
-esac
+exec "$bin" "$@"

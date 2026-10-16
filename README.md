@@ -1,6 +1,6 @@
 # sentry-triage
 
-A skill and a small Bash CLI that record Sentry issue investigations — what was
+A skill and a small CLI (a single Rust binary) that record Sentry issue investigations — what was
 looked at, when, and what was decided — in one store outside your projects.
 Past conclusions can then be found and re-checked later ("was API-42 already
 investigated? why was it closed? did the fix hold?").
@@ -22,8 +22,30 @@ triage init
 Or from a checkout: `bin/triage` is a relative symlink to
 `skills/sentry-triage/bin/triage`.
 
-Dependencies: Bash 3.2+, `git`, `awk`, `sed`, `grep`, coreutils. `rg` is used
-for `triage find` when present.
+Runtime dependencies: `git` (and `curl` or `wget` plus `tar` for the first-run download).
+
+### How the binary is obtained
+
+`skills/sentry-triage/bin/triage` is a small POSIX `sh` shim. It runs, in order:
+
+1. `$SENTRY_TRIAGE_BIN`, if set (any binary; nothing is downloaded);
+2. the cached `${XDG_CACHE_HOME:-~/.cache}/sentry-triage/<VERSION>/triage`;
+3. otherwise it downloads `triage-<target>.tar.gz` and its `.sha256` from the
+   GitHub release `v<VERSION>` (`<VERSION>` is `skills/sentry-triage/bin/VERSION`),
+   verifies the checksum, caches the binary and runs it. Targets: macOS
+   (arm64/x86_64) and Linux musl (x86_64/aarch64). `SENTRY_TRIAGE_RELEASE_BASE`
+   overrides the download base URL.
+
+If the download fails the shim exits 127 and prints the URL it tried, plus
+`cargo install --git https://github.com/dot-opencode/sentry-triage --tag v<VERSION>`
+and the `SENTRY_TRIAGE_BIN` alternative.
+
+### Building from source
+
+```bash
+cargo build --release          # target/release/triage
+SENTRY_TRIAGE_BIN=$PWD/target/release/triage bin/triage --version
+```
 
 ## Store
 
@@ -115,11 +137,22 @@ Entries that were not extracted cleanly keep their original text in `legacy/`.
 ## Tests
 
 ```bash
-bash tests/run.sh      # or: npm test
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo build --release
+TRIAGE=target/release/triage bash tests/run.sh      # default TRIAGE is target/release/triage
 ```
 
-Each test runs in an isolated temp `HOME` and `SENTRY_TRIAGE_HOME`. CI runs shellcheck,
-Linux, and macOS with bash 3.2 forced.
+Each black-box test runs in an isolated temp `HOME` and `SENTRY_TRIAGE_HOME`;
+the suite also covers the shim. CI runs fmt, clippy, unit tests, the suite on
+Linux and macOS, and shellcheck.
+
+## Releasing
+
+1. Bump `version` in `Cargo.toml` (and `Cargo.lock`) and put the same version in
+   `skills/sentry-triage/bin/VERSION`.
+2. Commit, then tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
+3. `release.yml` verifies tag = Cargo version = `VERSION`, builds the four
+   targets and uploads `triage-<target>.tar.gz` + `.sha256` to the GitHub release.
 
 ## License
 
