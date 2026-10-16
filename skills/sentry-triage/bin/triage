@@ -537,7 +537,7 @@ cmd_import() {
     [ -d "$sub" ] || continue
     sub="${sub%/}"
     name="$(basename "$sub")"
-    if ! [[ "$name" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)+$ ]]; then
+    if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_]*(-[A-Za-z0-9_]+)+$ ]]; then
       echo "ignored $name (not an issue id)"
       ignored=$((ignored + 1))
       continue

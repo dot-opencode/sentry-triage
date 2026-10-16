@@ -458,6 +458,8 @@ test_import_fixture_with_needs_investigation() {
   assert_eq "$(fm "$s" url)" "https://acme.sentry.io/issues/WEB-7"
   assert_eq "$(fm "$s" tracker)" "https://jira.example.com/browse/ACME-9"
   assert_file "$d/legacy/sentry-raw.md"
+  # Sentry project slugs may contain underscores.
+  assert_eq "$(fm "$SENTRY_TRIAGE_HOME/acme/AUDIO_STORAGE-4P/state.md" verdict)" expected
   assert_rc 0 "$TRIAGE" check
 }
 
