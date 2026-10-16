@@ -571,7 +571,7 @@ cmd_import() {
     mkdir -p "$dest/legacy"
     cp -R "$sub/." "$dest/legacy/"
     summary="imported from $sub"
-    summary="$summary$'\n'extracted: verdict=$verdict${url:+ url=$url}${tracker:+ tracker=$tracker}${confidence:+ confidence=$confidence}"
+    summary="$summary"$'\n'"extracted: verdict=$verdict${url:+ url=$url}${tracker:+ tracker=$tracker}${confidence:+ confidence=$confidence}"
     journal_append "$dest" "$summary"
     echo "imported $org/$issue (verdict=$verdict${url:+, url}${tracker:+, tracker})"
     imported=$((imported + 1))

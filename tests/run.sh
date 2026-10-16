@@ -439,6 +439,7 @@ test_import_fixture_with_bug_candidate() {
   assert_file "$d/legacy/state.md"
   assert_file "$d/legacy/youtrack.md"
   assert_contains "$(<"$d/journal.md")" "imported from $FIX/legacy-a/CORE-1"
+  case "$(<"$d/journal.md")" in *"\$'"*) fail "literal \$'\\n' in journal" ;; esac
   [ -d "$d/evidence" ] || fail "evidence/ missing"
   # ignore_candidate, trailing dot stripped from url
   s="$SENTRY_TRIAGE_HOME/acme/PROD-AB/state.md"
