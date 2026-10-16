@@ -2,7 +2,7 @@
 
 A skill and a small Bash CLI that record Sentry issue investigations — what was
 looked at, when, and what was decided — in one store outside your projects.
-Past conclusions can then be found and re-checked later ("was CORE-88 already
+Past conclusions can then be found and re-checked later ("was API-42 already
 investigated? why was it closed? did the fix hold?").
 
 It is **personal** and **tracker-agnostic**: it stores links to YouTrack/Jira/etc.
@@ -38,7 +38,7 @@ for `triage find` when present.
 ```
 
 `<org>` and `<ISSUE>` match `[A-Za-z0-9][A-Za-z0-9._-]*`. `ISSUE` is the Sentry
-short id (`CORE-88`), stored upper-case.
+short id (`API-42`), stored upper-case.
 
 ### state.md frontmatter
 
@@ -93,7 +93,7 @@ org has that issue; otherwise pass `--org`.
 
 ## Migrating old notes: `triage import`
 
-Each subdirectory of `<dir>` named like an issue id (`CORE-88`, `PRODUCTION-HJ`)
+Each subdirectory of `<dir>` named like an issue id (`API-42`, `WEB-7`)
 becomes an entry; others are reported as ignored and existing entries are skipped.
 All files are copied into `legacy/`; the source directory is never modified.
 Best-effort extraction from the legacy text:

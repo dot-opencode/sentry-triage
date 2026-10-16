@@ -98,15 +98,15 @@ test_commands_fail_without_store() {
 }
 
 test_new_creates_entry_with_template() {
-  assert_rc 0 "$TRIAGE" new core-88 --org acme --project core --url https://acme.sentry.io/issues/123 \
+  assert_rc 0 "$TRIAGE" new api-42 --org acme --project core --url https://acme.sentry.io/issues/123 \
     --repo git@example.com:acme/core.git --commit abc1234
-  local d="$SENTRY_TRIAGE_HOME/acme/CORE-88" s
+  local d="$SENTRY_TRIAGE_HOME/acme/API-42" s
   s="$d/state.md"
   assert_file "$s"; assert_file "$d/journal.md"
   [ -d "$d/evidence" ] || fail "evidence/ missing"
   assert_eq "$(head -1 "$s")" "---"
   assert_eq "$(fm "$s" schema)" 1
-  assert_eq "$(fm "$s" issue)" CORE-88
+  assert_eq "$(fm "$s" issue)" API-42
   assert_eq "$(fm "$s" org)" acme
   assert_eq "$(fm "$s" project)" core
   assert_eq "$(fm "$s" url)" "https://acme.sentry.io/issues/123"
@@ -460,7 +460,7 @@ test_import_fixture_with_needs_investigation() {
   assert_eq "$(fm "$s" tracker)" "https://jira.example.com/browse/ACME-9"
   assert_file "$d/legacy/sentry-raw.md"
   # Sentry project slugs may contain underscores.
-  assert_eq "$(fm "$SENTRY_TRIAGE_HOME/acme/AUDIO_STORAGE-4P/state.md" verdict)" expected
+  assert_eq "$(fm "$SENTRY_TRIAGE_HOME/acme/DATA_STORE-1/state.md" verdict)" expected
   assert_rc 0 "$TRIAGE" check
 }
 

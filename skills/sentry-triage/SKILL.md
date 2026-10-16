@@ -1,6 +1,6 @@
 ---
 name: sentry-triage
-description: Record and re-check Sentry issue investigations with the `triage` CLI. Use when investigating a Sentry issue (short id like CORE-88), deciding whether it is a bug or expected, or when asked whether an issue was already looked at, reopened, or why it was closed.
+description: Record and re-check Sentry issue investigations with the `triage` CLI. Use when investigating a Sentry issue (short id like API-42), deciding whether it is a bug or expected, or when asked whether an issue was already looked at, reopened, or why it was closed.
 license: MIT
 ---
 
