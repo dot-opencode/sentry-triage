@@ -85,7 +85,9 @@ fetch "$url.sha256" "$tmp/$asset.sha256" || fail "download of the checksum faile
 
 want="$(cut -d' ' -f1 < "$tmp/$asset.sha256" | tr -d '[:space:]')"
 got="$(sha256_of "$tmp/$asset")" || fail "neither sha256sum nor shasum is available to verify the download"
-[ -n "$want" ] && [ "$want" = "$got" ] || fail "checksum mismatch for $asset"
+if [ -z "$want" ] || [ "$want" != "$got" ]; then
+  fail "checksum mismatch for $asset"
+fi
 
 tar -xzf "$tmp/$asset" -C "$tmp" triage || fail "cannot extract $asset"
 chmod +x "$tmp/triage"
