@@ -1,0 +1,7 @@
+{
+  "name": "sentry-triage",
+  "private": true,
+  "scripts": {
+    "test": "bash tests/run.sh"
+  }
+}
