@@ -604,6 +604,9 @@ test_shim_downloads_verifies_and_caches() {
   assert_rc 0 env SENTRY_TRIAGE_RELEASE_BASE="file://$base" "$SHIM" --version
   assert_contains "$OUT" "triage 0."
   [ -x "$XDG_CACHE_HOME/sentry-triage/$v/triage" ] || fail "binary not cached"
+  for leftover in "$XDG_CACHE_HOME/sentry-triage/$v"/.dl.*; do
+    [ ! -e "$leftover" ] || fail "download temp dir left behind: $leftover"
+  done
   assert_rc 0 env SENTRY_TRIAGE_RELEASE_BASE="file:///nonexistent" "$SHIM" --version
 }
 

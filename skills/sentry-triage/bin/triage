@@ -93,4 +93,7 @@ tar -xzf "$tmp/$asset" -C "$tmp" triage || fail "cannot extract $asset"
 chmod +x "$tmp/triage"
 mv -f "$tmp/triage" "$bin" || fail "cannot install $bin"
 
+# exec replaces this shell, so the EXIT trap would never fire: clean up first.
+rm -rf "$tmp"
+trap - EXIT INT TERM HUP
 exec "$bin" "$@"
