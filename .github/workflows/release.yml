@@ -12,13 +12,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Tag, Cargo.toml and bin/VERSION must agree
+      - name: Tag, Cargo.toml, bin/VERSION and package.json must agree
         run: |
           tag="${GITHUB_REF_NAME#v}"
           cargo_v="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           file_v="$(tr -d '[:space:]' < skills/sentry-triage/bin/VERSION)"
-          echo "tag=$tag Cargo.toml=$cargo_v VERSION=$file_v"
-          [ "$tag" = "$cargo_v" ] && [ "$tag" = "$file_v" ]
+          pkg_v="$(node -p 'require("./package.json").version')"
+          echo "tag=$tag Cargo.toml=$cargo_v VERSION=$file_v package.json=$pkg_v"
+          [ "$tag" = "$cargo_v" ] && [ "$tag" = "$file_v" ] && [ "$tag" = "$pkg_v" ]
 
   build:
     needs: check-version
@@ -84,3 +85,13 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+
+  publish-branch:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Move release branch to the tagged commit
+        run: git push origin "+$GITHUB_SHA:refs/heads/release"

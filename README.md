@@ -13,11 +13,34 @@ The agent protocol lives in [`skills/sentry-triage/SKILL.md`](skills/sentry-tria
 ## Install
 
 ```bash
+opencode plugin add github:dot-opencode/sentry-triage#release
+triage init     # needs `triage` on PATH, or run it by the full path (see below)
+```
+
+The `release` branch moves only after a GitHub Release (and its binaries) is
+published, so you see updates on releases only. The plugin registers the bundled
+`sentry-triage` skill itself (unless a skill with that name is already installed,
+e.g. via `npx skills`, which then wins) and tells the agent the absolute path of
+the CLI, so nothing needs to be on `PATH` for the agent. Update with:
+
+```bash
+opencode plugin check      # is there a newer release?
+opencode plugin update     # fetch it; then restart the OpenCode service / reload
+```
+
+For your own shell, putting `triage` on `PATH` is optional. A package install
+lives under `~/.cache/opencode/npm/…/node_modules/opencode-sentry-triage/skills/sentry-triage/bin/triage`,
+which changes on update; the path the plugin shows the agent is always current.
+
+### Alternative: `npx skills`
+
+```bash
 npx skills add dot-opencode/sentry-triage -g -a opencode
 # optional: put the CLI on your PATH
 ln -s ~/.agents/skills/sentry-triage/bin/triage ~/.local/bin/triage
-triage init
 ```
+
+This tracks `main`, so it may run ahead of the published binaries.
 
 Or from a checkout: `bin/triage` is a relative symlink to
 `skills/sentry-triage/bin/triage`.
@@ -143,16 +166,18 @@ TRIAGE=target/release/triage bash tests/run.sh      # default TRIAGE is target/r
 ```
 
 Each black-box test runs in an isolated temp `HOME` and `SENTRY_TRIAGE_HOME`;
-the suite also covers the shim. CI runs fmt, clippy, unit tests, the suite on
-Linux and macOS, and shellcheck.
+the suite also covers the shim. `node --test tests/*.test.js` covers the plugin.
+CI runs fmt, clippy, unit tests, the suite on Linux and macOS, the plugin tests,
+and shellcheck.
 
 ## Releasing
 
 1. Bump `version` in `Cargo.toml` (and `Cargo.lock`) and put the same version in
-   `skills/sentry-triage/bin/VERSION`.
+   `skills/sentry-triage/bin/VERSION` and `package.json`.
 2. Commit, then tag and push: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
-3. `release.yml` verifies tag = Cargo version = `VERSION`, builds the four
-   targets and uploads `triage-<target>.tar.gz` + `.sha256` to the GitHub release.
+3. `release.yml` verifies tag = Cargo version = `VERSION` = `package.json` version,
+   builds the four targets, uploads `triage-<target>.tar.gz` + `.sha256` to the
+   GitHub release, then moves the `release` branch to the tagged commit.
 
 ## License
 
